@@ -24,15 +24,19 @@ def emit_state(state):
         sys.stdout.write("{}\n".format(line))
         sys.stdout.flush()
 
-def flatten(d, parent_key='', sep='__'):
-    items = []
-    for k, v in d.items():
-        new_key = parent_key + sep + k if parent_key else k
-        if isinstance(v, collections.MutableMapping):
-            items.extend(flatten(v, new_key, sep=sep).items())
-        else:
-            items.append((new_key, str(v) if type(v) is list else v))
-    return dict(items)
+def tosql(data, config):
+    pks = config["keys"]
+    pks_str = ", ".join(pks)
+    entity = config["entity"]
+
+    keys = data.keys()
+    keys_nopk = [k for k in keys if k not in pks]
+    keys_str = ", ".join(keys)
+    values = [f"'{data[x]}'" for x in keys]
+    values_str = ", ".join(values)
+    values_upd = [f"{x}=EXCLUDED.{x}" for x in keys_nopk]
+    values_upd_str = ", ".join(values_upd)
+    return f"INSERT INTO {entity} ({keys_str}) VALUES({values_str}) ON CONFLICT ({pks_str}) DO UPDATE SET {values_upd_str};"
         
 def persist_lines(config, lines):
     state = None
@@ -44,71 +48,53 @@ def persist_lines(config, lines):
     now = datetime.now().strftime('%Y%m%dT%H%M%S')
 
     # Loop over lines from stdin
-    for line in lines:
-        try:
-            o = json.loads(line)
-        except json.decoder.JSONDecodeError:
-            logger.error("Unable to parse:\n{}".format(line))
-            raise
+    with open("data.sql", "w") as f:
+        for line in lines:
+            try:
+                o = json.loads(line)
+            except json.decoder.JSONDecodeError:
+                logger.error("Unable to parse:\n{}".format(line))
+                raise
 
-        if 'type' not in o:
-            raise Exception("Line is missing required key 'type': {}".format(line))
-        t = o['type']
+            if 'type' not in o:
+                raise Exception("Line is missing required key 'type': {}".format(line))
+            t = o['type']
 
-        if t == 'RECORD':
-            if 'stream' not in o:
-                raise Exception("Line is missing required key 'stream': {}".format(line))
-            if o['stream'] not in schemas:
-                raise Exception("A record for stream {} was encountered before a corresponding schema".format(o['stream']))
+            if t == 'RECORD':
+                if 'stream' not in o:
+                    raise Exception("Line is missing required key 'stream': {}".format(line))
+                if o['stream'] not in schemas:
+                    raise Exception("A record for stream {} was encountered before a corresponding schema".format(o['stream']))
 
-            # Get schema for this record's stream
-            schema = schemas[o['stream']]
+                # Get schema for this record's stream
+                schema = schemas[o['stream']]
 
-            # Validate record
-            validators[o['stream']].validate(o['record'])
+                # Validate record
+                validators[o['stream']].validate(o['record'])
 
-            # If the record needs to be flattened, uncomment this line
-            # flattened_record = flatten(o['record'])
-            
-            # TODO: Process Record message here..
+                # If the record needs to be flattened, uncomment this line
+                # flattened_record = flatten(o['record'])
+                
+                f.write("{}\n".format(tosql(o['record'], config)))
 
-            state = None
-        elif t == 'STATE':
-            logger.debug('Setting state to {}'.format(o['value']))
-            state = o['value']
-        elif t == 'SCHEMA':
-            if 'stream' not in o:
-                raise Exception("Line is missing required key 'stream': {}".format(line))
-            stream = o['stream']
-            schemas[stream] = o['schema']
-            validators[stream] = Draft4Validator(o['schema'])
-            if 'key_properties' not in o:
-                raise Exception("key_properties field is required")
-            key_properties[stream] = o['key_properties']
-        else:
-            raise Exception("Unknown message type {} in message {}"
-                            .format(o['type'], o))
+                state = None
+            elif t == 'STATE':
+                logger.debug('Setting state to {}'.format(o['value']))
+                state = o['value']
+            elif t == 'SCHEMA':
+                if 'stream' not in o:
+                    raise Exception("Line is missing required key 'stream': {}".format(line))
+                stream = o['stream']
+                schemas[stream] = o['schema']
+                validators[stream] = Draft4Validator(o['schema'])
+                if 'key_properties' not in o:
+                    raise Exception("key_properties field is required")
+                key_properties[stream] = o['key_properties']
+            else:
+                raise Exception("Unknown message type {} in message {}"
+                                .format(o['type'], o))
     
     return state
-
-
-def send_usage_stats():
-    try:
-        version = pkg_resources.get_distribution('target-csv').version
-        conn = http.client.HTTPConnection('collector.singer.io', timeout=10)
-        conn.connect()
-        params = {
-            'e': 'se',
-            'aid': 'singer',
-            'se_ca': 'singer-target-postgresql',
-            'se_ac': 'open',
-            'se_la': version,
-        }
-        conn.request('GET', '/i?' + urllib.parse.urlencode(params))
-        response = conn.getresponse()
-        conn.close()
-    except:
-        logger.debug('Collection request failed')
 
 
 def main():
@@ -116,17 +102,15 @@ def main():
     parser.add_argument('-c', '--config', help='Config file')
     args = parser.parse_args()
 
+
     if args.config:
         with open(args.config) as input:
             config = json.load(input)
     else:
         config = {}
 
-    if not config.get('disable_collection', False):
-        logger.info('Sending version information to singer.io. ' +
-                    'To disable sending anonymous usage data, set ' +
-                    'the config parameter "disable_collection" to true')
-        threading.Thread(target=send_usage_stats).start()
+    assert("keys" in config)
+    assert("entity" in config)
 
     input = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
     state = persist_lines(config, input)
